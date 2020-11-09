@@ -21,7 +21,8 @@ along with dem2mesh.  If not, see <https://www.gnu.org/licenses/>.
 #include <sstream>
 #include <cmath>
 #include <unordered_map>
-#include <omp.h>
+#include <thread>
+#include <mutex>
 #include "CmdLineParser.h"
 #include "Logger.h"
 #include "Simplify.h"
@@ -39,6 +40,12 @@ typedef struct Point2D{
    Point2D(double x, double y): x(x), y(y){}
 } Point2D;
 
+typedef struct Block{
+   int x;
+   int y;
+   Block(int x, int y): x(x), y(y){};
+} Block;
+
 typedef struct BoundingBox{
     Point2D max;
     Point2D min;
@@ -47,23 +54,32 @@ typedef struct BoundingBox{
     BoundingBox(Point2D min, Point2D max): max(max), min(min){}
 } BoundingBox;
 
-struct PlyPoint{
+typedef struct PlyPoint{
     float x;
     float y;
     float z;
-} p;
+} PlyPoint;
 size_t psize = sizeof(float) * 3;
 
-struct PlyFace{
+typedef struct PlyFace{
     uint32_t p1;
     uint32_t p2;
     uint32_t p3;
-} face;
+} PlyFace;
 size_t fsize = sizeof(uint32_t) * 3;
 
 int arr_width, arr_height;
 int subdivisions;
 int blockSizeX, blockSizeY;
+int qtreeLevels = 0;
+GDALRasterBand *band;
+BoundingBox extent;
+int hasNoData;
+int numBlocks;
+double nodata;
+std::vector<Block> blocksQueue;
+std::vector<std::thread> threads;
+std::mutex readLock;
 
 #define IS_BIG_ENDIAN (*(uint16_t *)"\0\xff" < 0x100)
 
@@ -143,13 +159,15 @@ void writePly(const std::string &filename, int thread){
         << "property list uchar int vertex_indices" << std::endl
         << "end_header" << std::endl;
 
-    for(Simplify::Vertex &v : *Simplify::vertices[thread]){
+    PlyPoint p;
+        for(Simplify::Vertex &v : *Simplify::vertices[thread]){
         p.x = static_cast<float>(v.p.x);
         p.y = static_cast<float>(v.p.y);
         p.z = static_cast<float>(v.p.z);
         f.write(reinterpret_cast<char *>(&p), psize);
     }
 
+    PlyFace face;
     uint8_t three = 3;
     for(Simplify::Triangle &t : *Simplify::triangles[thread]){
         face.p1 = static_cast<uint32_t>(t.v[0]);
@@ -174,6 +192,7 @@ void writeBin(const std::string &filename, int blockWidth, int blockHeight, int 
     f.write(reinterpret_cast<char *>(&vsize), sizeof(vsize));
     f.write(reinterpret_cast<char *>(&tsize), sizeof(tsize));
 
+    PlyPoint p;
     for(Simplify::Vertex &v : *Simplify::vertices[thread]){
         p.x = static_cast<float>(v.p.x);
         p.y = static_cast<float>(v.p.y);
@@ -181,6 +200,7 @@ void writeBin(const std::string &filename, int blockWidth, int blockHeight, int 
         f.write(reinterpret_cast<char *>(&p), psize);
     }
 
+    PlyFace face;
     for(Simplify::Triangle &t : *Simplify::triangles[thread]){
         face.p1 = static_cast<uint32_t>(t.v[0]);
         face.p2 = static_cast<uint32_t>(t.v[1]);
@@ -320,6 +340,111 @@ void transform(const BoundingBox &extent, int thread){
     }
 }
 
+void processBlocks(int t){
+    float *rasterData = new float[blockSizeX + 1];
+
+    while(!blocksQueue.empty()){
+        Block block = blocksQueue.back();
+        blocksQueue.pop_back();
+
+        int blockX = block.x;
+        int blockY = block.y;
+        int blockXPad = blockX == 0 ? 0 : 1; // Blocks > 0 need to re-add a column for seamless meshing
+        int blockYPad = blockY == 0 ? 0 : 1; // Blocks > 0 need to re-add a row for seamless meshing
+        int xOffset = blockX * blockSizeX - blockXPad;
+        int yOffset = blockY * blockSizeY - blockYPad;
+
+        Simplify::vertices[t]->clear();
+        Simplify::triangles[t]->clear();
+
+        logWriter("Processing block (%d,%d)\n", blockX, blockY);
+
+        for (int y = 0; y < blockSizeY + blockYPad; y++){
+            {
+                std::lock_guard<std::mutex> guard(readLock);
+                if (band->RasterIO( GF_Read, xOffset, yOffset + y, blockSizeX + blockXPad, 1,
+                                    rasterData, blockSizeX + blockXPad, 1, GDT_Float32, 0, 0 ) == CE_Failure){
+                    std::cerr << "Cannot access raster data" << std::endl;
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            for (int x = 0; x < blockSizeX + blockXPad; x++){
+                Simplify::Vertex v;
+                v.p.x = xOffset + x;
+                v.p.y = yOffset + y;
+                v.p.z = rasterData[x];
+                Simplify::vertices[t]->push_back(v);
+            }
+        }
+
+        unsigned int cols = blockSizeX + blockXPad;
+        unsigned int rows = blockSizeY + blockYPad;
+
+        for (unsigned int y = 0; y < rows - 1; y++){
+            for (unsigned int x = 0; x < cols - 1; x++){
+                Simplify::Triangle t1;
+                t1.v[0] = cols * (y + 1) + x;
+                t1.v[1] = cols * y + x + 1;
+                t1.v[2] = cols * y + x;
+                if (y == 0 || x == 0 || y == rows - 2 || x == cols - 2) t1.deleted = -1; // freeze
+                else t1.deleted = 0;
+
+                if (!hasNoData ||
+                   ((*Simplify::vertices[t])[t1.v[0]].p.z != nodata &&
+                    (*Simplify::vertices[t])[t1.v[1]].p.z != nodata &&
+                    (*Simplify::vertices[t])[t1.v[2]].p.z != nodata)){
+                    Simplify::triangles[t]->push_back(t1);
+                }
+
+                Simplify::Triangle t2;
+                t2.v[0] = cols * (y + 1) + x;
+                t2.v[1] = cols * (y + 1) + x + 1;
+                t2.v[2] = cols * y + x + 1;
+                if (y == 0 || x == 0 || y == rows - 2 || x == cols - 2) t2.deleted = -1; // freeze
+                else t2.deleted = 0;
+
+                if (!hasNoData ||
+                   ((*Simplify::vertices[t])[t2.v[0]].p.z != nodata &&
+                    (*Simplify::vertices[t])[t2.v[1]].p.z != nodata &&
+                    (*Simplify::vertices[t])[t2.v[2]].p.z != nodata)){
+                    Simplify::triangles[t]->push_back(t2);
+                }
+
+            }
+        }
+
+        int trianglesPerBlock = (MaxVertexCount.value * 2) / numBlocks;
+
+        // If we have a merge step,
+        // overshoot the triangle count requirement
+        // since we'll simplify the final mesh anyway.
+        // This leads to more uniform meshes.
+        if (qtreeLevels > 0) trianglesPerBlock = trianglesPerBlock * 3 / 2;
+
+        int target_count = std::min(trianglesPerBlock, static_cast<int>(Simplify::triangles[t]->size()));
+
+        logWriter("Sampled %d faces, target is %d\n", static_cast<int>(Simplify::triangles[t]->size()), target_count);
+        logWriter("Simplifying...\n");
+        simplify(target_count, t);
+
+        if (qtreeLevels == 0){
+            transform(extent, t);
+            logWriter("Single quad tree level, saving to PLY\n");
+            logWriter("Writing to file...");
+            writePly(OutputFile.value, t);
+        }else{
+            logWriter("Writing to binary file...");
+            std::stringstream ss;
+            ss << OutputFile.value << "." << blockX << "-" << blockY << ".bin";
+            writeBin(ss.str(), blockSizeX + blockXPad, blockSizeY + blockYPad, t);
+        }
+    }
+
+    delete[] rasterData;
+}
+
+
 int main(int argc, char **argv) {
     cmdLineParse( argc-1 , &argv[1] , params );
     if( !InputFile.set || !OutputFile.set ) help(argv[0]);
@@ -327,7 +452,7 @@ int main(int argc, char **argv) {
     if ( !MaxTileLength.set ) MaxTileLength.value = 1000;
     if ( !Aggressiveness.set ) Aggressiveness.value = 5;
     if ( !BandNum.set ) BandNum.value = 1;
-    if ( !MaxConcurrency.set ) MaxConcurrency.value = omp_get_max_threads();
+    if ( !MaxConcurrency.set ) MaxConcurrency.value = std::thread::hardware_concurrency();
     if ( MaxConcurrency.value == 0 ) MaxConcurrency.value = 1;
 
     Aggressiveness.value = std::min(10, std::max(1, Aggressiveness.value));
@@ -344,14 +469,14 @@ int main(int argc, char **argv) {
         arr_height = dataset->GetRasterYSize();
 
         logWriter("Raster Size is %dx%d\n", arr_width, arr_height);
-        BoundingBox extent = getExtent(dataset);
+        extent = getExtent(dataset);
 
         logWriter("Extent is (%f, %f), (%f, %f)\n", extent.min.x, extent.max.x, extent.min.y, extent.max.y);
 
-        GDALRasterBand *band = dataset->GetRasterBand(BandNum.value);
+        band = dataset->GetRasterBand(BandNum.value);
 
-        int hasNoData = FALSE;
-        double nodata = band->GetNoDataValue(&hasNoData);
+        hasNoData = FALSE;
+        nodata = band->GetNoDataValue(&hasNoData);
 
         if (hasNoData){
             logWriter("NoData value: %.18g\n", nodata);
@@ -364,8 +489,7 @@ int main(int argc, char **argv) {
         logWriter("Reading raster...\n");
         logWriter("Total vertices before simplification: %llu\n", vertex_count);
 
-        int qtreeLevels = 0;
-        int numBlocks = 1;
+        numBlocks = 1;
         while(true){
             subdivisions = (int)pow(2, qtreeLevels);
             numBlocks = subdivisions * subdivisions;
@@ -384,116 +508,30 @@ int main(int argc, char **argv) {
 
         logWriter("Concurrency set to %d\n", MaxConcurrency.value);
         Simplify::allocate(MaxConcurrency.value);
-        omp_set_num_threads(MaxConcurrency.value);
 
-        int rasterDataBlocks = std::min(MaxConcurrency.value, numBlocks);
-        logWriter("Allocating %d raster data blocks of %d bytes\n", rasterDataBlocks, sizeof(float) * (blockSizeX + 1));
-        float *rasterData = new float[rasterDataBlocks * (blockSizeX + 1)];
+        int numThreads = std::min(MaxConcurrency.value, numBlocks);
+        logWriter("Allocating %d raster data blocks of %d bytes\n", numThreads, sizeof(float) * (blockSizeX + 1));
 
-        omp_lock_t readLock;
-        omp_init_lock(&readLock);
-
-        #pragma omp parallel for collapse(2)
         for (int blockX = 0; blockX < subdivisions; blockX++){
             for (int blockY = 0; blockY < subdivisions; blockY++){
-                int t = omp_get_thread_num();
-                int blockXPad = blockX == 0 ? 0 : 1; // Blocks > 0 need to re-add a column for seamless meshing
-                int blockYPad = blockY == 0 ? 0 : 1; // Blocks > 0 need to re-add a row for seamless meshing
-                int xOffset = blockX * blockSizeX - blockXPad;
-                int yOffset = blockY * blockSizeY - blockYPad;
-
-                Simplify::vertices[t]->clear();
-                Simplify::triangles[t]->clear();
-
-                logWriter("Processing block (%d,%d)\n", blockX, blockY);
-
-                for (int y = 0; y < blockSizeY + blockYPad; y++){
-
-                    omp_set_lock(&readLock);
-                    if (band->RasterIO( GF_Read, xOffset, yOffset + y, blockSizeX + blockXPad, 1,
-                                        rasterData + t * (blockSizeX + 1), blockSizeX + blockXPad, 1, GDT_Float32, 0, 0 ) == CE_Failure){
-                        std::cerr << "Cannot access raster data" << std::endl;
-                        exit(EXIT_FAILURE);
-                    }
-                    omp_unset_lock(&readLock);
-
-                    for (int x = 0; x < blockSizeX + blockXPad; x++){
-                        Simplify::Vertex v;
-                        v.p.x = xOffset + x;
-                        v.p.y = yOffset + y;
-                        v.p.z = (rasterData + t * (blockSizeX + 1))[x];
-
-                        Simplify::vertices[t]->push_back(v);
-                    }
-                }
-
-                unsigned int cols = blockSizeX + blockXPad;
-                unsigned int rows = blockSizeY + blockYPad;
-
-                for (unsigned int y = 0; y < rows - 1; y++){
-                    for (unsigned int x = 0; x < cols - 1; x++){
-                        Simplify::Triangle t1;
-                        t1.v[0] = cols * (y + 1) + x;
-                        t1.v[1] = cols * y + x + 1;
-                        t1.v[2] = cols * y + x;
-                        if (y == 0 || x == 0 || y == rows - 2 || x == cols - 2) t1.deleted = -1; // freeze
-                        else t1.deleted = 0;
-
-                        if (!hasNoData ||
-                           ((*Simplify::vertices[t])[t1.v[0]].p.z != nodata &&
-                            (*Simplify::vertices[t])[t1.v[1]].p.z != nodata &&
-                            (*Simplify::vertices[t])[t1.v[2]].p.z != nodata)){
-                            Simplify::triangles[t]->push_back(t1);
-                        }
-
-                        Simplify::Triangle t2;
-                        t2.v[0] = cols * (y + 1) + x;
-                        t2.v[1] = cols * (y + 1) + x + 1;
-                        t2.v[2] = cols * y + x + 1;
-                        if (y == 0 || x == 0 || y == rows - 2 || x == cols - 2) t2.deleted = -1; // freeze
-                        else t2.deleted = 0;
-
-                        if (!hasNoData ||
-                           ((*Simplify::vertices[t])[t2.v[0]].p.z != nodata &&
-                            (*Simplify::vertices[t])[t2.v[1]].p.z != nodata &&
-                            (*Simplify::vertices[t])[t2.v[2]].p.z != nodata)){
-                            Simplify::triangles[t]->push_back(t2);
-                        }
-
-                    }
-                }
-
-                int trianglesPerBlock = (MaxVertexCount.value * 2) / numBlocks;
-
-                // If we have a merge step,
-                // overshoot the triangle count requirement
-                // since we'll simplify the final mesh anyway.
-                // This leads to more uniform meshes.
-                if (qtreeLevels > 0) trianglesPerBlock = trianglesPerBlock * 3 / 2;
-
-                int target_count = std::min(trianglesPerBlock, static_cast<int>(Simplify::triangles[t]->size()));
-
-                logWriter("Sampled %d faces, target is %d\n", static_cast<int>(Simplify::triangles[t]->size()), target_count);
-                logWriter("Simplifying...\n");
-                simplify(target_count, t);
-
-                if (qtreeLevels == 0){
-                    transform(extent, t);
-                    logWriter("Single quad tree level, saving to PLY\n");
-                    logWriter("Writing to file...");
-                    writePly(OutputFile.value, t);
-                }else{
-                    logWriter("Writing to binary file...");
-                    std::stringstream ss;
-                    ss << OutputFile.value << "." << blockX << "-" << blockY << ".bin";
-                    writeBin(ss.str(), blockSizeX + blockXPad, blockSizeY + blockYPad, t);
-                }
-
-                logWriter(" done!\n");
+                blocksQueue.push_back(Block(blockX, blockY));
             }
         }
 
-        delete[] rasterData;
+        if (MaxConcurrency.value > 1){
+            for (int i = 0; i < numThreads; i++){
+                std::thread t(processBlocks, i);
+                threads.push_back(std::move(t));
+            }
+
+            for (int i = 0; i < numThreads; i++){
+                threads[i].join();
+            }
+        }else{
+            processBlocks(0);
+        }
+
+        logWriter(" done!\n");
         GDALClose(dataset);
 
         if (qtreeLevels > 0){
